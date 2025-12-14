@@ -72,8 +72,8 @@ This sketch assumes the following (see the gerber files with the project too...)
 #define PRE_GEN_TARGET 133         // Pre generation we target about 650mV (133 * 5000/1023 == 650mV)
 #define PRE_GEN_HOLD 150           // how many milliseconds to hold
 
-#define ADC_AVERAGE 4              // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
-#define ADC_AVERAGE_BITS 2         // log2(ADC_AVERAGE)
+#define ADC_AVERAGE 8              // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
+#define ADC_AVERAGE_BITS 3         // log2(ADC_AVERAGE)
 #define ADC_HYSTERESIS 2           // how many ADC codes to assume are close enough
 #define PWM_BIG_STEP 8             // take large steps of 8 * 5000/1023 = 39.1mV if the error is that large
 #define PWM_SMALL_STEP 1           // take smaller steps if the error is small
@@ -91,9 +91,105 @@ unsigned long pre_gen_time;
 unsigned current_adc, target_adc, training_adc = 0;
 int integral_sum = 0; // accumulated error over time
 
+#ifdef DEBUG
+#define TX_PIN PIN_DEBUG
+#define BAUD_RATE 2400
+// Calculate the time (in microseconds) for one bit period: 1,000,000 / BAUD_RATE
+#define BIT_PERIOD_US 417
+
+// Initialize the TX pin to be an output (High when idle)
+void tinySerial_begin() {
+  pinMode(TX_PIN, OUTPUT);
+  digitalWrite(TX_PIN, HIGH); // Line is HIGH when idle
+  delay(1); // Small startup delay
+}
+
+// Sends a single byte (non-blocking when called)
+void tinySerial_write(unsigned char data) {
+  unsigned char mask;
+  // Use bit 1 for PB1
+  #define TX_BIT 1 
+
+  cli();
+  
+  // 1. Send START BIT (LOW for one period)
+  PORTB &= ~(_BV(TX_BIT)); // FAST: Set PB1 LOW
+  delayMicroseconds(BIT_PERIOD_US);
+
+  // 2. Send DATA BITS (8 bits, LSB first)
+  for (mask = 1; mask > 0; mask <<= 1) {
+    if (data & mask) {
+      PORTB |= _BV(TX_BIT); // FAST: Set PB1 HIGH
+    } else {
+      PORTB &= ~(_BV(TX_BIT)); // FAST: Set PB1 LOW
+    }
+    delayMicroseconds(BIT_PERIOD_US);
+  }
+
+  // 3. Send STOP BIT (HIGH for one period)
+  PORTB |= _BV(TX_BIT); // FAST: Set PB1 HIGH
+  delayMicroseconds(BIT_PERIOD_US);
+
+  sei();
+}
+// Sends a string (converts it to bytes)
+void tinySerial_print(char *str) {
+  while (pgm_read_byte(str)) {
+    tinySerial_write(pgm_read_byte(str++));
+  }
+}
+
+// Sends a string followed by a carriage return and newline
+void tinySerial_println(char *str) {
+  tinySerial_print(str);
+  tinySerial_write('\r');
+  tinySerial_write('\n');
+}
+
+// Prints a signed 16-bit integer (up to +/- 32767).
+void tinySerial_printInt(int n) {
+  char buf[6]; // Buffer size for -32767 + null terminator
+  char *str = buf;
+  char *p;
+  unsigned int k;
+  
+  // 1. Handle negative sign
+  if (n < 0) {
+    tinySerial_write('-');
+    k = -n; // Convert to positive unsigned value
+  } else {
+    k = n;
+  }
+  
+  // 2. Handle 0 separately
+  if (k == 0) {
+    tinySerial_write('0');
+    return;
+  }
+  
+  // 3. Convert integer to reverse ASCII string (e.g., 123 becomes '3', '2', '1')
+  while (k > 0) {
+    // 0x30 is ASCII '0'
+    *str++ = (char)(k % 10 + 0x30); 
+    k /= 10;
+  }
+  *str = '\0'; // Null-terminate the temporary string
+  
+  // 4. Print the characters in the correct order (reverse the temporary string)
+  for (p = str - 1; p >= buf; p--) {
+    tinySerial_write(*p);
+  }
+}
+#endif
+
 void load_target()
 {
   target_adc = ((unsigned)EEPROM.read(1) << 8) | ((unsigned)EEPROM.read(2));
+#ifdef DEBUG
+  tinySerial_print(PSTR("target_adc <= "));
+  tinySerial_printInt(target_adc);
+  tinySerial_println(PSTR(""));
+#endif  
 }
 
 void store_target(unsigned target)
@@ -164,102 +260,6 @@ void setup_pregen()
   pre_gen_time = millis() + PRE_GEN_HOLD; // must sustain low voltage for time before proceeding to target
 }
 
-#ifdef DEBUG
-#define TX_PIN PIN_DEBUG // Your existing PIN_DEBUG
-#define BAUD_RATE 2400
-// Calculate the time (in microseconds) for one bit period: 1,000,000 / BAUD_RATE
-#define BIT_PERIOD_US 417
-
-// Initialize the TX pin to be an output (High when idle)
-void tinySerial_begin() {
-  pinMode(TX_PIN, OUTPUT);
-  digitalWrite(TX_PIN, HIGH); // Line is HIGH when idle
-  delay(1); // Small startup delay
-}
-
-// Sends a single byte (non-blocking when called)
-// Sends a single byte (non-blocking when called)
-void tinySerial_write(unsigned char data) {
-  unsigned char mask;
-  // Use bit 1 for PB1
-  #define TX_BIT 1 
-
-  cli();
-  
-  // 1. Send START BIT (LOW for one period)
-  // digitalWrite(TX_PIN, LOW); // Slow
-  PORTB &= ~(_BV(TX_BIT)); // FAST: Set PB1 LOW
-  delayMicroseconds(BIT_PERIOD_US);
-
-  // 2. Send DATA BITS (8 bits, LSB first)
-  for (mask = 1; mask > 0; mask <<= 1) {
-    if (data & mask) {
-      // digitalWrite(TX_PIN, HIGH); // Slow
-      PORTB |= _BV(TX_BIT); // FAST: Set PB1 HIGH
-    } else {
-      // digitalWrite(TX_PIN, LOW); // Slow
-      PORTB &= ~(_BV(TX_BIT)); // FAST: Set PB1 LOW
-    }
-    delayMicroseconds(BIT_PERIOD_US);
-  }
-
-  // 3. Send STOP BIT (HIGH for one period)
-  // digitalWrite(TX_PIN, HIGH); // Slow
-  PORTB |= _BV(TX_BIT); // FAST: Set PB1 HIGH
-  delayMicroseconds(BIT_PERIOD_US);
-
-  sei();
-}
-// Sends a string (converts it to bytes)
-void tinySerial_print(char *str) {
-  while (pgm_read_byte(str)) {
-    tinySerial_write(pgm_read_byte(str++));
-  }
-}
-
-// Sends a string followed by a carriage return and newline
-void tinySerial_println(char *str) {
-  tinySerial_print(str);
-  tinySerial_write('\r');
-  tinySerial_write('\n');
-}
-
-// Prints a signed 16-bit integer (up to +/- 32767).
-void tinySerial_printInt(int n) {
-  char buf[6]; // Buffer size for -32767 + null terminator
-  char *str = buf;
-  char *p;
-  unsigned int k;
-  
-  // 1. Handle negative sign
-  if (n < 0) {
-    tinySerial_write('-');
-    k = -n; // Convert to positive unsigned value
-  } else {
-    k = n;
-  }
-  
-  // 2. Handle 0 separately
-  if (k == 0) {
-    tinySerial_write('0');
-    return;
-  }
-  
-  // 3. Convert integer to reverse ASCII string (e.g., 123 becomes '3', '2', '1')
-  while (k > 0) {
-    // 0x30 is ASCII '0'
-    *str++ = (char)(k % 10 + 0x30); 
-    k /= 10;
-  }
-  *str = '\0'; // Null-terminate the temporary string
-  
-  // 4. Print the characters in the correct order (reverse the temporary string)
-  for (p = str - 1; p >= buf; p--) {
-    tinySerial_write(*p);
-  }
-}
-#endif
-
 void setup() {
 #ifdef DEBUG  
   tinySerial_begin();
@@ -294,14 +294,13 @@ void loop()
 {
 #ifdef DEBUG
   static unsigned long foo = 0;
-  if (++foo == 16) {
-    // Print fsm_state (signed int)
+  if (++foo == 64) {
     tinySerial_printInt(fsm_state);
     tinySerial_print(PSTR(", ")); // Print separator
-    // Print current_adc (unsigned int, but works fine with printInt for low values)
     tinySerial_printInt(current_adc);
     tinySerial_print(PSTR(", ")); // Print separator
-    // Print cur_pwm (unsigned char/int)
+    tinySerial_printInt(target_adc);
+    tinySerial_print(PSTR(", ")); // Print separator
     tinySerial_printInt(cur_pwm);
     tinySerial_println(PSTR("")); // Add newline
     foo = 0;
@@ -312,7 +311,7 @@ void loop()
 //  analogWrite(PIN_DEBUG, analogRead(PIN_ADC) >> 2);
 #endif  
   // detect config pin...
-  if (digitalRead(PIN_CONFIG) == LOW) {
+  if (fsm_state != FSM_CONFIG_SENSE && digitalRead(PIN_CONFIG) == LOW) {
     // wait 10ms to make sure it's really low
     delay(10);
     if (digitalRead(PIN_CONFIG) == LOW) {
@@ -362,7 +361,7 @@ void loop()
       if (millis() > pre_gen_time) {
           setup_pregen();
 #ifdef DEBUG
-          tinySerial_println(PSTR("Going from FSM_GEN_FAULT back to FSM_PRE_GEN"));
+          tinySerial_println(PSTR("Going from FSM_WAIT_RECOVERY back to FSM_PRE_GEN"));
 #endif
       }
       break;
@@ -393,6 +392,11 @@ void loop()
             setup_pregen();
             training_adc = 0;
             training_cnt = 0;
+          } else {
+#ifdef DEBUG
+            tinySerial_println(PSTR("Invalid sensed voltage during training, going to FSM_PRE_GEN state."));
+#endif
+            setup_pregen();
           }
         }
       }
