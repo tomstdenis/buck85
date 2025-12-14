@@ -72,8 +72,8 @@ This sketch assumes the following (see the gerber files with the project too...)
 #define PRE_GEN_TARGET 133         // Pre generation we target about 650mV (133 * 5000/1023 == 650mV)
 #define PRE_GEN_HOLD 150           // how many milliseconds to hold
 
-#define ADC_AVERAGE 8              // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
-#define ADC_AVERAGE_BITS 3         // log2(ADC_AVERAGE)
+#define ADC_AVERAGE 16              // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
+#define ADC_AVERAGE_BITS 4         // log2(ADC_AVERAGE)
 #define ADC_HYSTERESIS 2           // how many ADC codes to assume are close enough
 #define PWM_BIG_STEP 8             // take large steps of 8 * 5000/1023 = 39.1mV if the error is that large
 #define PWM_SMALL_STEP 1           // take smaller steps if the error is small
@@ -93,9 +93,19 @@ int integral_sum = 0; // accumulated error over time
 
 #ifdef DEBUG
 #define TX_PIN PIN_DEBUG
-#define BAUD_RATE 2400
+
+//#define BAUD_RATE 2400
+//#define BAUD_RATE 9600
+#define BAUD_RATE 19200
+
 // Calculate the time (in microseconds) for one bit period: 1,000,000 / BAUD_RATE
+#if BAUD_RATE == 2400
 #define BIT_PERIOD_US 417
+#elif BAUD_RATE == 9600
+#define BIT_PERIOD_US 104
+#elif BAUD_RATE == 19200
+#define BIT_PERIOD_US 52
+#endif
 
 // Initialize the TX pin to be an output (High when idle)
 void tinySerial_begin() {
@@ -294,7 +304,7 @@ void loop()
 {
 #ifdef DEBUG
   static unsigned char foo = 0;
-  if (++foo == 64) {
+  if ((fsm_state == FSM_GEN || fsm_state == FSM_PRE_GEN) && !++foo) {
     tinySerial_printInt(fsm_state);
     tinySerial_print(PSTR(", ")); // Print separator
     tinySerial_printInt(current_adc);
@@ -319,6 +329,9 @@ void loop()
       tinySerial_println(PSTR("Going into FSM_CONFIG_SENSE mode..."));
 #endif      
       fsm_state = FSM_CONFIG_SENSE;
+      training_adc = 0;
+      training_cnt = 0;
+      TCCR0B = (TCCR0B & 0xF8) | 0x00; // Stop Timer0 (Clock source = No clock)
     }
   }
 
@@ -373,21 +386,22 @@ void loop()
       if (digitalRead(PIN_CONFIG) == LOW) {
         training_adc += analogRead(PIN_ADC);
         if (++training_cnt == 64) {
-          training_adc = (training_adc + 32) >> 6;
+          training_adc >>= 6;
           training_cnt = 0;
         }
       } else {
         // pin is HIGH let's ensure it stays high for 10ms and then store
+          TCCR0B = (TCCR0B & 0xF8) | 0x01; // turn TIMER0 back on
         delay(10);
         if (digitalRead(PIN_CONFIG) == HIGH) {
           // pin still high so let's assume it was released and store the trained data
           if (training_cnt) {
-            training_adc = (training_adc + (training_cnt >> 1)) / training_cnt;
+            training_adc /= training_cnt;
           }
           // only store valid training data
           if (training_adc > TOO_LOW && training_adc <= TOO_HIGH) {
 #ifdef DEBUG
-            tinySerial_print(PSTR("Going from FSM_CONFIG_SENSE to FSM_PRE_GEN: trained ADC =="));
+            tinySerial_print(PSTR("Going from FSM_CONFIG_SENSE to FSM_PRE_GEN: trained ADC == "));
             tinySerial_printInt(training_adc);
             tinySerial_println(PSTR(""));
 #endif
