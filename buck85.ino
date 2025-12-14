@@ -152,6 +152,7 @@ void update_pwm()
 
 void setup_pregen()
 {
+  integral_sum = 0;
   fsm_state = FSM_PRE_GEN; // go back to pre-gen phase
   target_adc = PRE_GEN_TARGET;
   cur_pwm = 192; // 75% duty cycle to ensure the mosfet is on (25% of the time)
@@ -220,6 +221,7 @@ void loop()
         if (millis() >= pre_gen_time && abs((int)current_adc - (int)target_adc) < PRE_GEN_MAX_DELTA) {
           fsm_state = FSM_GEN;
           load_target();
+          integral_sum = 0;
         }
       }
       break;
