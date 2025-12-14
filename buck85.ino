@@ -52,16 +52,18 @@ This sketch assumes the following (see the gerber files with the project too...)
 
 #include <EEPROM.h>
 
-// use PB1 as a PWM signal to debug 
+// use PIN_DEBUG as serial debugger (serial code is hard coded to use PB1)
 #define DEBUG
 
-#ifdef DEBUG
-#include <SoftwareSerial.h>
-SoftwareSerial softSerial(PB1, PB2); // PB2==TX so that's what you should read
+// use PIN_DEBUG as PWM debugger
+#ifndef DEBUG
+//#define DEBUG_PWM
 #endif
+
+#define PIN_DEBUG  PB1
 #define PIN_CONFIG PB3
-#define PIN_PWM PB0 // if you change this you need to change the timer code too in setup()
-#define PIN_ADC PB4
+#define PIN_PWM    PB0 // if you change this you need to change the timer code too in setup()
+#define PIN_ADC    A2  // use A* name not PB* name here
 
 #define TOO_LOW 13                 // anything below 64mV is considered a short (13 * 5000/1023 == 63.53mV)
 #define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 500/1023 == 4643mV)
@@ -81,6 +83,7 @@ enum {
    FSM_GEN,
    FSM_GEN_FAULT, // turn off mosfet to disable output because we detected a fault
    FSM_CONFIG_SENSE, // sense and average the ADC code 
+   FSM_WAIT_RECOVERY, // state to enter when fault occurs
 };
 
 unsigned char fsm_state, cur_pwm = 224, training_cnt = 0; // set cur_pwm to mostly on because it's a P-channel so a HIGH means turn the mosfet off
@@ -161,17 +164,121 @@ void setup_pregen()
   pre_gen_time = millis() + PRE_GEN_HOLD; // must sustain low voltage for time before proceeding to target
 }
 
+#ifdef DEBUG
+#define TX_PIN PIN_DEBUG // Your existing PIN_DEBUG
+#define BAUD_RATE 2400
+// Calculate the time (in microseconds) for one bit period: 1,000,000 / BAUD_RATE
+#define BIT_PERIOD_US 417
+
+// Initialize the TX pin to be an output (High when idle)
+void tinySerial_begin() {
+  pinMode(TX_PIN, OUTPUT);
+  digitalWrite(TX_PIN, HIGH); // Line is HIGH when idle
+  delay(1); // Small startup delay
+}
+
+// Sends a single byte (non-blocking when called)
+// Sends a single byte (non-blocking when called)
+void tinySerial_write(unsigned char data) {
+  unsigned char mask;
+  // Use bit 1 for PB1
+  #define TX_BIT 1 
+
+  cli();
+  
+  // 1. Send START BIT (LOW for one period)
+  // digitalWrite(TX_PIN, LOW); // Slow
+  PORTB &= ~(_BV(TX_BIT)); // FAST: Set PB1 LOW
+  delayMicroseconds(BIT_PERIOD_US);
+
+  // 2. Send DATA BITS (8 bits, LSB first)
+  for (mask = 1; mask > 0; mask <<= 1) {
+    if (data & mask) {
+      // digitalWrite(TX_PIN, HIGH); // Slow
+      PORTB |= _BV(TX_BIT); // FAST: Set PB1 HIGH
+    } else {
+      // digitalWrite(TX_PIN, LOW); // Slow
+      PORTB &= ~(_BV(TX_BIT)); // FAST: Set PB1 LOW
+    }
+    delayMicroseconds(BIT_PERIOD_US);
+  }
+
+  // 3. Send STOP BIT (HIGH for one period)
+  // digitalWrite(TX_PIN, HIGH); // Slow
+  PORTB |= _BV(TX_BIT); // FAST: Set PB1 HIGH
+  delayMicroseconds(BIT_PERIOD_US);
+
+  sei();
+}
+// Sends a string (converts it to bytes)
+void tinySerial_print(char *str) {
+  while (pgm_read_byte(str)) {
+    tinySerial_write(pgm_read_byte(str++));
+  }
+}
+
+// Sends a string followed by a carriage return and newline
+void tinySerial_println(char *str) {
+  tinySerial_print(str);
+  tinySerial_write('\r');
+  tinySerial_write('\n');
+}
+
+// Prints a signed 16-bit integer (up to +/- 32767).
+void tinySerial_printInt(int n) {
+  char buf[6]; // Buffer size for -32767 + null terminator
+  char *str = buf;
+  char *p;
+  unsigned int k;
+  
+  // 1. Handle negative sign
+  if (n < 0) {
+    tinySerial_write('-');
+    k = -n; // Convert to positive unsigned value
+  } else {
+    k = n;
+  }
+  
+  // 2. Handle 0 separately
+  if (k == 0) {
+    tinySerial_write('0');
+    return;
+  }
+  
+  // 3. Convert integer to reverse ASCII string (e.g., 123 becomes '3', '2', '1')
+  while (k > 0) {
+    // 0x30 is ASCII '0'
+    *str++ = (char)(k % 10 + 0x30); 
+    k /= 10;
+  }
+  *str = '\0'; // Null-terminate the temporary string
+  
+  // 4. Print the characters in the correct order (reverse the temporary string)
+  for (p = str - 1; p >= buf; p--) {
+    tinySerial_write(*p);
+  }
+}
+#endif
+
 void setup() {
+#ifdef DEBUG  
+  tinySerial_begin();
+  tinySerial_println(PSTR("\r\n\r\nHello from Buck85\r\n"));
+#endif
+#ifdef DEBUG_PWM
+  pinMode(PIN_DEBUG, OUTPUT);
+#endif
+
   // disable the mosfet
   pinMode(PIN_PWM, OUTPUT);
   TCCR0B = (TCCR0B & 0xF8) | 0x01; // set PIN_PWM to 31.25KHz
   analogWrite(PIN_PWM, 255); // turn off MOSFET
-#ifdef DEBUG  
-  softSerial.begin(1200);
-#endif
+
   // configure config pin
   pinMode(PIN_CONFIG, INPUT_PULLUP);
+
   // configure ADC to use internal ref
+  pinMode(PIN_ADC, INPUT);
   analogReference(INTERNAL);
 
   // configure EEPROM
@@ -183,26 +290,35 @@ void setup() {
   // let things settle for a second
   setup_pregen();
 }
-
 void loop() 
 {
 #ifdef DEBUG
   static unsigned long foo = 0;
-  if (++foo == 1024) {
-    softSerial.print("FSM state: ");
-    softSerial.println(fsm_state);
-    softSerial.print("ADC reading == ");
-    softSerial.println(current_adc);
-    softSerial.print("PWM == ");
-    softSerial.println(cur_pwm);
+  if (++foo == 16) {
+    // Print fsm_state (signed int)
+    tinySerial_printInt(fsm_state);
+    tinySerial_print(PSTR(", ")); // Print separator
+    // Print current_adc (unsigned int, but works fine with printInt for low values)
+    tinySerial_printInt(current_adc);
+    tinySerial_print(PSTR(", ")); // Print separator
+    // Print cur_pwm (unsigned char/int)
+    tinySerial_printInt(cur_pwm);
+    tinySerial_println(PSTR("")); // Add newline
     foo = 0;
   }
+#endif
+#ifdef DEBUG_PWM
+  analogWrite(PIN_DEBUG, 48 * (1 + fsm_state));
+//  analogWrite(PIN_DEBUG, analogRead(PIN_ADC) >> 2);
 #endif  
   // detect config pin...
   if (digitalRead(PIN_CONFIG) == LOW) {
     // wait 10ms to make sure it's really low
     delay(10);
     if (digitalRead(PIN_CONFIG) == LOW) {
+#ifdef DEBUG
+      tinySerial_println(PSTR("Going into FSM_CONFIG_SENSE mode..."));
+#endif      
       fsm_state = FSM_CONFIG_SENSE;
     }
   }
@@ -214,7 +330,7 @@ void loop()
       if (current_adc < TOO_LOW) {
         // a short occured jump to FSM_GEN_FAULT
 #ifdef DEBUG
-        softSerial.println("Going from FSM_PRE_GEN to FSM_GEN_FAULT because ADC was too low.");
+        tinySerial_println(PSTR("Going from FSM_PRE_GEN to FSM_GEN_FAULT because ADC was too low."));
 #endif
         fsm_state = FSM_GEN_FAULT;
       } else {
@@ -232,18 +348,23 @@ void loop()
         // a short occured jump to FSM_GEN_FAULT
         fsm_state = FSM_GEN_FAULT;
 #ifdef DEBUG
-        softSerial.println("Going from FSM_GEN to FSM_GEN_FAULT because ADC was too low.");
+        tinySerial_println(PSTR("Going from FSM_GEN to FSM_GEN_FAULT because ADC was too low."));
 #endif
       }
       break;
     case FSM_GEN_FAULT:
       // a fault occurred, so let's sleep for a second, reset to 0.5V and try again
       analogWrite(PIN_PWM, 255); // turn off MOSFET
-      delay(1000);
-      setup_pregen();
+      fsm_state = FSM_WAIT_RECOVERY;
+      pre_gen_time = millis() + 1000;
+      break;
+    case FSM_WAIT_RECOVERY:
+      if (millis() > pre_gen_time) {
+          setup_pregen();
 #ifdef DEBUG
-        softSerial.println("Going from FSM_GEN_FAULT back to FSM_PRE_GEN");
+          tinySerial_println(PSTR("Going from FSM_GEN_FAULT back to FSM_PRE_GEN"));
 #endif
+      }
       break;
     case FSM_CONFIG_SENSE:
       // if the pin is still low read the ADC and average
@@ -264,7 +385,9 @@ void loop()
           // only store valid training data
           if (training_adc > TOO_LOW && training_adc <= TOO_HIGH) {
 #ifdef DEBUG
-            softSerial.println("Going from FSM_CONFIG_SENSE to FSM_PRE_GEN.");
+            tinySerial_print(PSTR("Going from FSM_CONFIG_SENSE to FSM_PRE_GEN: trained ADC =="));
+            tinySerial_printInt(training_adc);
+            tinySerial_println(PSTR(""));
 #endif
             store_target(training_adc);
             setup_pregen();
