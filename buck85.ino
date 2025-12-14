@@ -203,7 +203,7 @@ void store_target(unsigned target)
 void update_pwm()
 {
   int new_pwm, delta, sign;
-  uint32_t sum;
+  unsigned sum;
   unsigned char x;
 
   for (sum = x = 0; x < ADC_AVERAGE; x++) {
@@ -293,7 +293,7 @@ void setup() {
 void loop() 
 {
 #ifdef DEBUG
-  static unsigned long foo = 0;
+  static unsigned char foo = 0;
   if (++foo == 64) {
     tinySerial_printInt(fsm_state);
     tinySerial_print(PSTR(", ")); // Print separator
@@ -334,6 +334,9 @@ void loop()
         fsm_state = FSM_GEN_FAULT;
       } else {
         if (millis() >= pre_gen_time && abs((int)current_adc - (int)target_adc) < PRE_GEN_MAX_DELTA) {
+#ifdef DEBUG
+          tinySerial_println(PSTR("Going form FSM_PRE_GEN to FSM_GEN."));
+#endif        
           fsm_state = FSM_GEN;
           load_target();
           integral_sum = 0;
@@ -370,7 +373,7 @@ void loop()
       if (digitalRead(PIN_CONFIG) == LOW) {
         training_adc += analogRead(PIN_ADC);
         if (++training_cnt == 64) {
-          training_adc >>= 6;
+          training_adc = (training_adc + 32) >> 6;
           training_cnt = 0;
         }
       } else {
@@ -379,7 +382,7 @@ void loop()
         if (digitalRead(PIN_CONFIG) == HIGH) {
           // pin still high so let's assume it was released and store the trained data
           if (training_cnt) {
-            training_adc /= training_cnt;
+            training_adc = (training_adc + (training_cnt >> 1)) / training_cnt;
           }
           // only store valid training data
           if (training_adc > TOO_LOW && training_adc <= TOO_HIGH) {
