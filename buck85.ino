@@ -70,7 +70,7 @@ This sketch assumes the following (see the gerber files with the project too...)
 
 #define PRE_GEN_MAX_DELTA 4        // how close to the target training voltage before going into GEN phase (4 * 5000/1023 == 19.55mV)
 #define PRE_GEN_TARGET 133         // Pre generation we target about 650mV (133 * 5000/1023 == 650mV)
-#define PRE_GEN_HOLD 150           // how many milliseconds to hold
+#define PRE_GEN_HOLD (150*64)      // how many milliseconds to hold (x64 due to prescaler)
 
 #define ADC_AVERAGE 16              // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
 #define ADC_AVERAGE_BITS 4         // log2(ADC_AVERAGE)
@@ -266,7 +266,7 @@ void setup_pregen()
   target_adc = PRE_GEN_TARGET;
   cur_pwm = 192; // 75% duty cycle to ensure the mosfet is on (25% of the time)
   analogWrite(PIN_PWM, cur_pwm);
-  delay(5); // let the circuit pre-charge the capacitors a bit before reading the feedback pin
+  delay(5*64); // let the circuit pre-charge the capacitors a bit before reading the feedback pin
   pre_gen_time = millis() + PRE_GEN_HOLD; // must sustain low voltage for time before proceeding to target
 }
 
@@ -323,7 +323,7 @@ void loop()
   // detect config pin...
   if (fsm_state != FSM_CONFIG_SENSE && digitalRead(PIN_CONFIG) == LOW) {
     // wait 10ms to make sure it's really low
-    delay(10);
+    delay(10*64);
     if (digitalRead(PIN_CONFIG) == LOW) {
 #ifdef DEBUG
       tinySerial_println(PSTR("Going into FSM_CONFIG_SENSE mode..."));
@@ -371,7 +371,7 @@ void loop()
       // a fault occurred, so let's sleep for a second, reset to 0.5V and try again
       analogWrite(PIN_PWM, 255); // turn off MOSFET
       fsm_state = FSM_WAIT_RECOVERY;
-      pre_gen_time = millis() + 1000;
+      pre_gen_time = millis() + 64000; // 64x prescaler * 1000ms
       break;
     case FSM_WAIT_RECOVERY:
       if (millis() > pre_gen_time) {
@@ -391,8 +391,8 @@ void loop()
         }
       } else {
         // pin is HIGH let's ensure it stays high for 10ms and then store
-          TCCR0B = (TCCR0B & 0xF8) | 0x01; // turn TIMER0 back on
-        delay(10);
+        TCCR0B = (TCCR0B & 0xF8) | 0x01; // turn TIMER0 back on
+        delay(10*64);
         if (digitalRead(PIN_CONFIG) == HIGH) {
           // pin still high so let's assume it was released and store the trained data
           if (training_cnt) {
