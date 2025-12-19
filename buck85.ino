@@ -2,6 +2,8 @@
 
 Simple? 5 volt buck convert that uses a P-channel mosfet attached to PIN_PWM.
 
+NOTE:  YOU MUST USE THE BOD 4.3V TARGET FOR THIS TO WORK CORRECTLY.
+
 It uses a roughly 5:1 divider on PIN_ADC so we can map 5 volts to below the 1.1 internal reference
 voltage.
 
@@ -53,7 +55,7 @@ This sketch assumes the following (see the gerber files with the project too...)
 #include <EEPROM.h>
 
 // use PIN_DEBUG as serial debugger (serial code is hard coded to use PB1)
-#define DEBUG
+//#define DEBUG
 
 // use PIN_DEBUG as PWM debugger
 #ifndef DEBUG
@@ -68,25 +70,23 @@ This sketch assumes the following (see the gerber files with the project too...)
 #define TOO_LOW 13                 // anything below 64mV is considered a short (13 * 5000/1023 == 63.53mV)
 #define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 500/1023 == 4643mV)
 
-#define PRE_GEN_MAX_DELTA 4        // how close to the target training voltage before going into GEN phase (4 * 5000/1023 == 19.55mV)
-#define PRE_GEN_TARGET 133         // Pre generation we target about 650mV (133 * 5000/1023 == 650mV)
-#define PRE_GEN_HOLD (150*64)      // how many milliseconds to hold (x64 due to prescaler)
+#define DEFAULT_TARGET (133U)      // 133 * 5000 / 1023 == 650mV
 
-#define ADC_AVERAGE 16              // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
-#define ADC_AVERAGE_BITS 4         // log2(ADC_AVERAGE)
-#define ADC_HYSTERESIS 2           // how many ADC codes to assume are close enough
-#define PWM_BIG_STEP 8             // take large steps of 8 * 5000/1023 = 39.1mV if the error is that large
-#define PWM_SMALL_STEP 1           // take smaller steps if the error is small
+#define ADC_AVERAGE_BITS 2                   // log2(ADC_AVERAGE)
+#define ADC_AVERAGE (1U << ADC_AVERAGE_BITS) // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
+#define PWM_BIG_STEP 10                       // take large steps of 8 * 5000/1023 = 39.1mV if the error is that large
+#define PWM_SMALL_STEP 1                     // take smaller steps if the error is small
+
+#define TRAINING_LOOPS 4 // how many times do we average the training adc value before stopping
 
 enum {
-   FSM_PRE_GEN=0, // low output before target output to detect shorts
    FSM_GEN,
    FSM_GEN_FAULT, // turn off mosfet to disable output because we detected a fault
    FSM_CONFIG_SENSE, // sense and average the ADC code 
    FSM_WAIT_RECOVERY, // state to enter when fault occurs
 };
 
-unsigned char fsm_state, cur_pwm = 224, training_cnt = 0; // set cur_pwm to mostly on because it's a P-channel so a HIGH means turn the mosfet off
+unsigned char training_loop, fsm_state, cur_pwm = 224, training_cnt = 0; // set cur_pwm to mostly on because it's a P-channel so a HIGH means turn the mosfet off
 unsigned long pre_gen_time;
 unsigned current_adc, target_adc, training_adc = 0;
 int integral_sum = 0; // accumulated error over time
@@ -94,24 +94,18 @@ int integral_sum = 0; // accumulated error over time
 #ifdef DEBUG
 #define TX_PIN PIN_DEBUG
 
-//#define BAUD_RATE 2400
-//#define BAUD_RATE 9600
-#define BAUD_RATE 19200
+//#define BAUD_RATE 2400UL
+//#define BAUD_RATE 9600UL
+#define BAUD_RATE 19200UL
 
 // Calculate the time (in microseconds) for one bit period: 1,000,000 / BAUD_RATE
-#if BAUD_RATE == 2400
-#define BIT_PERIOD_US 417
-#elif BAUD_RATE == 9600
-#define BIT_PERIOD_US 104
-#elif BAUD_RATE == 19200
-#define BIT_PERIOD_US 52
-#endif
+#define BIT_PERIOD_US (1000000UL / BAUD_RATE)
 
 // Initialize the TX pin to be an output (High when idle)
 void tinySerial_begin() {
   pinMode(TX_PIN, OUTPUT);
   digitalWrite(TX_PIN, HIGH); // Line is HIGH when idle
-  delay(1); // Small startup delay
+  delay(5*64UL); // Small startup delay
 }
 
 // Sends a single byte (non-blocking when called)
@@ -225,29 +219,27 @@ void update_pwm()
   delta = (int)current_adc - (int)target_adc; // how far off are we in steps of 5000mV / 1023 == 4.88mV
   integral_sum += delta;
   new_pwm = (int)cur_pwm;
-  if (abs(delta) > ADC_HYSTERESIS) {
-    // calc signed delta
-    if (delta < 0) {
-      sign = -1;
-    } else {
-      sign = 1;
-    }
+  // calc signed delta
+  if (delta < 0) {
+    sign = -1;
+  } else {
+    sign = 1;
+  }
 
-    // adjust signed pwm count
-    if (abs(delta) >= PWM_BIG_STEP) {
-      new_pwm += PWM_BIG_STEP * sign;
-    } else if (delta) {
-      new_pwm += PWM_SMALL_STEP * sign;
-    }
+  // adjust signed pwm count
+  if (abs(delta) >= PWM_BIG_STEP) {
+    new_pwm += PWM_BIG_STEP * sign;
+  } else if (delta) {
+    new_pwm += PWM_SMALL_STEP * sign;
   }
   
   // saturate the integral error so we avoid winding up too hard
-  if (integral_sum > 127) {
-    integral_sum = 127;
-  } else if (integral_sum < -128) {
-    integral_sum = -128;
+  if (integral_sum > 255) {
+    integral_sum = 255;
+  } else if (integral_sum < -256) {
+    integral_sum = -256;
   }
-  new_pwm += integral_sum >> 5;
+  new_pwm += integral_sum >> 8;
 
   // saturate the PWM value
   if (new_pwm > 255) {
@@ -259,15 +251,14 @@ void update_pwm()
   analogWrite(PIN_PWM, cur_pwm);
 }
 
-void setup_pregen()
+void setup_gen()
 {
   integral_sum = 0;
-  fsm_state = FSM_PRE_GEN; // go back to pre-gen phase
-  target_adc = PRE_GEN_TARGET;
-  cur_pwm = 192; // 75% duty cycle to ensure the mosfet is on (25% of the time)
+  fsm_state = FSM_GEN; // go back to pre-gen phase
+  load_target();
+  cur_pwm = 255; // start with the MOSFET fully off
   analogWrite(PIN_PWM, cur_pwm);
-  delay(5*64); // let the circuit pre-charge the capacitors a bit before reading the feedback pin
-  pre_gen_time = millis() + PRE_GEN_HOLD; // must sustain low voltage for time before proceeding to target
+  delay(25*64); // let the circuit pre-charge the capacitors a bit before reading the feedback pin
 }
 
 void setup() {
@@ -282,6 +273,7 @@ void setup() {
   // disable the mosfet
   pinMode(PIN_PWM, OUTPUT);
   TCCR0B = (TCCR0B & 0xF8) | 0x01; // set PIN_PWM to 31.25KHz
+  TCCR1 &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12) | _BV(CS13)); // Stop Timer1
   analogWrite(PIN_PWM, 255); // turn off MOSFET
 
   // configure config pin
@@ -293,12 +285,12 @@ void setup() {
 
   // configure EEPROM
   if (EEPROM.read(0) != 0xA5) {
-    // configure to a low voltage (around 0.5V out of 5V)
-    store_target(PRE_GEN_TARGET);
+    // configure to a low voltage
+    store_target(DEFAULT_TARGET);
   }
 
   // let things settle for a second
-  setup_pregen();
+  setup_gen();
 }
 void loop() 
 {
@@ -322,8 +314,8 @@ void loop()
 #endif  
   // detect config pin...
   if (fsm_state != FSM_CONFIG_SENSE && digitalRead(PIN_CONFIG) == LOW) {
-    // wait 10ms to make sure it's really low
-    delay(10*64);
+    // wait 25ms to make sure it's really low
+    delay(25*64);
     if (digitalRead(PIN_CONFIG) == LOW) {
 #ifdef DEBUG
       tinySerial_println(PSTR("Going into FSM_CONFIG_SENSE mode..."));
@@ -331,37 +323,20 @@ void loop()
       fsm_state = FSM_CONFIG_SENSE;
       training_adc = 0;
       training_cnt = 0;
+      training_loop = 0;
+      digitalWrite(PIN_PWM, HIGH); // turn off mosfet
+      delay(150*64); // wait 150mS before sampling
       TCCR0B = (TCCR0B & 0xF8) | 0x00; // Stop Timer0 (Clock source = No clock)
     }
   }
 
   switch (fsm_state) {
-    case FSM_PRE_GEN:
-      // the "pre-gen" phase tries to hold a low voltage for some time to detect shorts on boot up
-      update_pwm(); // adjust pwm signal
-      if (current_adc < TOO_LOW) {
-        // a short occured jump to FSM_GEN_FAULT
-#ifdef DEBUG
-        tinySerial_println(PSTR("Going from FSM_PRE_GEN to FSM_GEN_FAULT because ADC was too low."));
-#endif
-        fsm_state = FSM_GEN_FAULT;
-      } else {
-        if (millis() >= pre_gen_time && abs((int)current_adc - (int)target_adc) < PRE_GEN_MAX_DELTA) {
-#ifdef DEBUG
-          tinySerial_println(PSTR("Going form FSM_PRE_GEN to FSM_GEN."));
-#endif        
-          fsm_state = FSM_GEN;
-          load_target();
-          integral_sum = 0;
-        }
-      }
-      break;
     case FSM_GEN:
       // in this mode we're good to go and can generate the programmed target voltage
       update_pwm();
       if (current_adc < TOO_LOW) {
         // a short occured jump to FSM_GEN_FAULT
-        fsm_state = FSM_GEN_FAULT;
+//        fsm_state = FSM_GEN_FAULT;
 #ifdef DEBUG
         tinySerial_println(PSTR("Going from FSM_GEN to FSM_GEN_FAULT because ADC was too low."));
 #endif
@@ -375,45 +350,45 @@ void loop()
       break;
     case FSM_WAIT_RECOVERY:
       if (millis() > pre_gen_time) {
-          setup_pregen();
+          setup_gen();
 #ifdef DEBUG
-          tinySerial_println(PSTR("Going from FSM_WAIT_RECOVERY back to FSM_PRE_GEN"));
+          tinySerial_println(PSTR("Going from FSM_WAIT_RECOVERY back to FSM_GEN"));
 #endif
       }
       break;
     case FSM_CONFIG_SENSE:
       // if the pin is still low read the ADC and average
       if (digitalRead(PIN_CONFIG) == LOW) {
-        training_adc += analogRead(PIN_ADC);
-        if (++training_cnt == 64) {
-          training_adc >>= 6;
-          training_cnt = 0;
+        if (training_loop < TRAINING_LOOPS) {
+          training_adc += analogRead(PIN_ADC);
+          if (++training_cnt == 32) {
+            training_adc >>= 5;
+            training_cnt = 0;
+            ++training_loop;
+          }
         }
       } else {
         // pin is HIGH let's ensure it stays high for 10ms and then store
         TCCR0B = (TCCR0B & 0xF8) | 0x01; // turn TIMER0 back on
-        delay(10*64);
+        delay(25*64);
         if (digitalRead(PIN_CONFIG) == HIGH) {
           // pin still high so let's assume it was released and store the trained data
-          if (training_cnt) {
-            training_adc /= training_cnt;
-          }
           // only store valid training data
           if (training_adc > TOO_LOW && training_adc <= TOO_HIGH) {
 #ifdef DEBUG
-            tinySerial_print(PSTR("Going from FSM_CONFIG_SENSE to FSM_PRE_GEN: trained ADC == "));
+            tinySerial_print(PSTR("Going from FSM_CONFIG_SENSE to FSM_GEN: trained ADC == "));
             tinySerial_printInt(training_adc);
             tinySerial_println(PSTR(""));
 #endif
             store_target(training_adc);
-            setup_pregen();
+            setup_gen();
             training_adc = 0;
             training_cnt = 0;
           } else {
 #ifdef DEBUG
-            tinySerial_println(PSTR("Invalid sensed voltage during training, going to FSM_PRE_GEN state."));
+            tinySerial_println(PSTR("Invalid sensed voltage during training, going to FSM_GEN state."));
 #endif
-            setup_pregen();
+            setup_gen();
           }
         }
       }
