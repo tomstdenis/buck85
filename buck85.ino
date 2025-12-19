@@ -1,8 +1,18 @@
 /*
 
+NOTE:  YOU MUST USE THE BOD 4.3V TARGET FOR THIS TO WORK CORRECTLY.
+
 Simple? 5 volt buck convert that uses a P-channel mosfet attached to PIN_PWM.
 
-NOTE:  YOU MUST USE THE BOD 4.3V TARGET FOR THIS TO WORK CORRECTLY.
+How to use:
+
+1.  A freshly programmed device will try to hit 0.650V by default.
+2.  To program:
+   2.1 Apply your reference voltage to the output pads
+   2.2 Short the CONFIG pad to ground (ideally with some resistance) for at least 2+ seconds continuously
+   2.3 Disconnect the CONFIG pad and turn off your reference voltage
+   2.4 Verify the programmed voltage is close to target (go back to 2.1 if it's off by too much)
+   2.5 (note: If there is a huge delta between the previous target it might take a few programming cycles to get the target right)
 
 It uses a roughly 5:1 divider on PIN_ADC so we can map 5 volts to below the 1.1 internal reference
 voltage.
@@ -42,6 +52,15 @@ This sketch assumes the following (see the gerber files with the project too...)
 
 12.  There's a suitable fast diode (I used a 40V 550mV 2A DSS24 diode)
 
+Layout:
+
+            /------------\
+   N/C    - |            | - VCC (5V)
+   CONFIG - | attiny85   | - N/C
+   FB     - |            | - DEBUG PIN
+   GND    - |            | - PWM out to mosfet gate (via 100Ohm resistor)
+            \------------/
+
 */
 
 #include <EEPROM.h>
@@ -60,14 +79,9 @@ This sketch assumes the following (see the gerber files with the project too...)
 #define PIN_ADC    A2  // use A* name not PB* name here
 
 #define TOO_LOW 13                 // anything below 64mV is considered a short (13 * 5000/1023 == 63.53mV)
-#define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 500/1023 == 4643mV)
+#define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 5000/1023 == 4643mV)
 
 #define DEFAULT_TARGET (133U)      // 133 * 5000 / 1023 == 650mV
-
-#define ADC_AVERAGE_BITS 2                   // log2(ADC_AVERAGE)
-#define ADC_AVERAGE (1U << ADC_AVERAGE_BITS) // how many samples to read at once (too many and it'll take too long to reach a stable target, too little and you'll get noise...)
-#define PWM_BIG_STEP 10                       // take large steps of 8 * 5000/1023 = 39.1mV if the error is that large
-#define PWM_SMALL_STEP 1                     // take smaller steps if the error is small
 
 #define TRAINING_LOOPS 4 // how many times do we average the training adc value before stopping
 
@@ -198,41 +212,25 @@ void store_target(unsigned target)
 // adjust the PWM to target the target_adc
 void update_pwm()
 {
-  int new_pwm, delta, sign;
+  int new_pwm, delta;
   unsigned sum;
   unsigned char x;
 
-  for (sum = x = 0; x < ADC_AVERAGE; x++) {
-    sum += analogRead(PIN_ADC);
-    delayMicroseconds(8); // at 31.25KHz PWM a full cycle is 32uS so we read across multiple quadrants of the wave
-  }
-  sum >>= ADC_AVERAGE_BITS;
-  current_adc = sum;
-
+  current_adc = analogRead(PIN_ADC);
   delta = (int)current_adc - (int)target_adc; // how far off are we in steps of 5000mV / 1023 == 4.88mV
   integral_sum += delta;
   new_pwm = (int)cur_pwm;
-  // calc signed delta
-  if (delta < 0) {
-    sign = -1;
-  } else {
-    sign = 1;
-  }
 
   // adjust signed pwm count
-  if (abs(delta) >= PWM_BIG_STEP) {
-    new_pwm += PWM_BIG_STEP * sign;
-  } else if (delta) {
-    new_pwm += PWM_SMALL_STEP * sign;
-  }
-  
+  new_pwm += (delta >> 1);
+
   // saturate the integral error so we avoid winding up too hard
   if (integral_sum > 255) {
     integral_sum = 255;
   } else if (integral_sum < -256) {
     integral_sum = -256;
   }
-  new_pwm += integral_sum >> 8;
+  new_pwm += (integral_sum + 128) >> 8;
 
   // saturate the PWM value
   if (new_pwm > 255) {
@@ -241,7 +239,7 @@ void update_pwm()
     new_pwm = 0;
   }
   cur_pwm = new_pwm;
-  analogWrite(PIN_PWM, cur_pwm);
+  OCR0A = cur_pwm;
 }
 
 void setup_gen()
@@ -250,11 +248,13 @@ void setup_gen()
   fsm_state = FSM_GEN; // go back to pre-gen phase
   load_target();
   cur_pwm = 255; // start with the MOSFET fully off
-  analogWrite(PIN_PWM, cur_pwm);
-  delay(25*64); // let the circuit pre-charge the capacitors a bit before reading the feedback pin
+  OCR0A = cur_pwm;
+  delay(25*64);
 }
 
 void setup() {
+  TCCR1 &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12) | _BV(CS13)); // Stop Timer1
+
 #ifdef DEBUG  
   tinySerial_begin();
   tinySerial_println(PSTR("\r\n\r\nHello from Buck85\r\n"));
@@ -265,10 +265,19 @@ void setup() {
 
   // disable the mosfet
   pinMode(PIN_PWM, OUTPUT);
-  TCCR0B = (TCCR0B & 0xF8) | 0x01; // set PIN_PWM to 31.25KHz
-  TCCR1 &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12) | _BV(CS13)); // Stop Timer1
-  analogWrite(PIN_PWM, 255); // turn off MOSFET
 
+  // 2. Configure Timer0 for Fast PWM on OC0A (PB0)
+  // COM0A1 = 1: Non-inverting PWM (Clear on match, set at BOTTOM)
+  // WGM01 & WGM00 = 1: Fast PWM Mode
+  TCCR0A = _BV(COM0A1) | _BV(WGM01) | _BV(WGM00);
+
+  // 3. Set the frequency (Prescaler)
+  // Your original code used (TCCR0B & 0xF8) | 0x01 which is "No Prescaling"
+  TCCR0B = (TCCR0B & 0xF8) | 0x01; 
+
+  // 4. Initial state: OFF for P-Channel (255 = Gate High)
+  OCR0A = 255;
+ 
   // configure config pin
   pinMode(PIN_CONFIG, INPUT_PULLUP);
 
@@ -303,7 +312,6 @@ void loop()
 #endif
 #ifdef DEBUG_PWM
   analogWrite(PIN_DEBUG, 48 * (1 + fsm_state));
-//  analogWrite(PIN_DEBUG, analogRead(PIN_ADC) >> 2);
 #endif  
   // detect config pin...
   if (fsm_state != FSM_CONFIG_SENSE && digitalRead(PIN_CONFIG) == LOW) {
@@ -317,8 +325,9 @@ void loop()
       training_adc = 0;
       training_cnt = 0;
       training_loop = 0;
-      analogWrite(PIN_PWM, 255); // turn off MOSFET
-      delay(250*64); // wait 250mS before sampling to let any stored inductance to dissipate
+      OCR0A = 255;
+      delay(500*64);
+      delay(500*64); // wait before sampling to let any stored inductance to dissipate
       TCCR0B = (TCCR0B & 0xF8) | 0x00; // Stop Timer0 (Clock source = No clock)
     }
   }
@@ -329,7 +338,7 @@ void loop()
       update_pwm();
       if (current_adc < TOO_LOW) {
         // a short occured jump to FSM_GEN_FAULT
-//        fsm_state = FSM_GEN_FAULT;
+        fsm_state = FSM_GEN_FAULT;
 #ifdef DEBUG
         tinySerial_println(PSTR("Going from FSM_GEN to FSM_GEN_FAULT because ADC was too low."));
 #endif
@@ -337,7 +346,7 @@ void loop()
       break;
     case FSM_GEN_FAULT:
       // a fault occurred, so let's sleep for a second, reset to 0.5V and try again
-      analogWrite(PIN_PWM, 255); // turn off MOSFET
+      OCR0A = 255;
       fsm_state = FSM_WAIT_RECOVERY;
       pre_gen_time = millis() + 64000; // 64x prescaler * 1000ms
       break;
