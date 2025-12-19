@@ -1,67 +1,54 @@
 /*
+ * =================================================================================
+ * PROJECT: Buck85 - ATtiny85 Programmable Buck Converter
+ * VERSION: 1.0.0
+ * EFFICIENCY: ~79-83% @ 5V Input (at a max of 1A output, gets about +20C at the diode/mosfet with a 1A load)
+ * =================================================================================
+ * * DESCRIPTION:
+ * A software-controlled DC-DC Buck Converter using an ATtiny85. It features a 
+ * "Training Mode" to set target voltages via an external reference and uses a 
+ * PID-lite control loop to maintain stability under load.
+ * * SAFETY NOTE: 
+ * You MUST program the ATtiny85 with BOD (Brown-Out Detection) set to 4.3V 
+ * to ensure the MOSFET shuts down safely during power loss.
+ * * HOW TO CONFIGURE (Training Mode):
+ * 1. Apply your desired target voltage to the OUTPUT pads (as a reference).
+ * 2. Short the CONFIG pad to GND for at least 2 seconds.
+ * 3. Release the CONFIG pad and remove your external reference.
+ * 4. The device will now store this ADC value in EEPROM and target it on startup.
+ * Note: If jumping from a very high to a very low voltage, you may need 
+ * to repeat this 2-3 times to allow the output caps to fully discharge.
+ * * HARDWARE SPECIFICATIONS:
+ * - Input: 5V DC (Stable)
+ * - Output Range: ~0.6V to 4.6V (Limited by Diode Vf and MOSFET overhead)
+ * - Max Load: 1.0A Continuous
+ * - Control Loop: 31.25kHz Fast PWM (8-bit) / 10-bit ADC Feedback
+ * - Resolution: ~4.88mV (ADC) / ~19.5mV (PWM step)
+ * * COMPONENT BILL OF MATERIALS (As Tested):
+ * - MCU: ATtiny85 (Internal 8MHz clock)
+ * - MOSFET: DMG2301L (P-Channel)
+ * - Diode: DSS24 Schottky (40V, 2A)
+ * - Inductor: 47uH Shielded (1.5A Saturation, <160mOhm DCR)
+ * - Feedback: 5:1 Voltage Divider (35.7k / 10k 1% resistors)
+ * - Gate Drive: 100 Ohm series resistor + 10k Ohm pull-up to VCC
+ * - Filtering:
+ *    - output: 2 X7R 22uF caps, 1 220uF aluminum cap
+ *    - input: 1 X7R 22uF cap, 1 220uF aluminum cap
+ * * PIN MAP:
+ *          /------------\
+ * N/C    - | PB5    VCC | - 5V Input
+ * CONFIG - | PB3    PB2 | - N/C
+ * FB     - | PB4    PB1 | - DEBUG / Serial TX
+ * GND    - | GND    PB0 | - PWM Out (to MOSFET Gate)
+ *          \------------/
+ * * TROUBLESHOOTING:
+ * - High Ripple (Vpp): Check inductor saturation and ESR of output caps. 
+ * Ensure ANTI_WINDUP_MS is tuned to your specific LC filter inertia.
+ * - Fault Mode: If output drops below 64mV (TOO_LOW), the system enters 
+ * FSM_GEN_FAULT to protect against shorts.
+ * =================================================================================
+ */
 
-NOTE:  YOU MUST USE THE BOD 4.3V TARGET FOR THIS TO WORK CORRECTLY.
-
-Simple? 5 volt buck convert that uses a P-channel mosfet attached to PIN_PWM.
-
-How to use:
-
-1.  A freshly programmed device will try to hit 0.650V by default.
-2.  To program:
-   2.1 Apply your reference voltage to the output pads
-   2.2 Short the CONFIG pad to ground (ideally with some resistance) for at least 2+ seconds continuously
-   2.3 Disconnect the CONFIG pad and turn off your reference voltage
-   2.4 Verify the programmed voltage is close to target (go back to 2.1 if it's off by too much)
-   2.5 (note: If there is a huge delta between the previous target it might take a few programming cycles to get the target right)
-
-It uses a roughly 5:1 divider on PIN_ADC so we can map 5 volts to below the 1.1 internal reference
-voltage.
-
-if PIN_CONFIG is grounded it goes into "config mode" where it reads PIN_ADC and averages it into
-a running total.  Once PIN_CONFIG goes high again it stores the trained ADC value in EEPROM and 
-goes into "pre gen" mode.
-
-This sketch assumes the following (see the gerber files with the project too...):
-
-1.  A somewhat stable 5 volt input is provided.  This isn't really designed for lower input voltages
-    but it may work a slightly lower (though the mosfet might have higher resistance)
-
-2.  The output is capped at a min of TOO_LOW (currently: 63.53mV) so lower voltages are not possible.
-    Expect a range of roughly 100mV to 4600mV thereabouts though it's probably only stable starting at just above Vf (so around 600mV)
-    You will want to cap TOO_HIGH to something like 950 (4.64V) because higher than that and the circuit can be inefficient 
-    (both in power and it's ability to respond to load changes)
-
-3.  It's not highly precise... the PWM is 8-bits and the ADC is 10-bit.  So expect step sizes of probably around 15-20mV
-
-4.  It's meant for 1A continuous load max. The control resolution (one ADC count) is ~4.88mV, and the PWM resolution is 19.5mV per
-    PWM_BIG_STEP. Not really suitable for highly variable loads (motors/etc).
-
-5.  There's a resistor in series with the PWM pin and mosfet gate (I used a 100 Ohm)
-
-6.  There's a pullup to Vcc attached to the mosfet gate (I used a 10kOhm)
-
-7.  There's output filtering (I used 2x22uF ceramic + 1x220uF aluminum caps) (ensure the ceramics are low ESR)
-
-8.  There's input filtering (I used 1x22uF ceramic + 1x220uF aluminum caps)
-
-9.  There's a 5:1 divider attached to the ADC pin (I used 1% 35.7kOhm + 10kOhm resistors)
-
-10.  The mosfet can easily switch and has low ON resistance with the -5V the tiny85 provides (I used a DMG2301L)
-
-11.  The inductor is shielded and can saturate a bit more than 1 amp (I used a Fixed Inductor 47uH 1.5 amp 156mOhm)
-
-12.  There's a suitable fast diode (I used a 40V 550mV 2A DSS24 diode)
-
-Layout:
-
-            /------------\
-   N/C    - |            | - VCC (5V)
-   CONFIG - | attiny85   | - N/C
-   FB     - |            | - DEBUG PIN
-   GND    - |            | - PWM out to mosfet gate (via 100Ohm resistor)
-            \------------/
-
-*/
 
 #include <EEPROM.h>
 
@@ -82,6 +69,7 @@ Layout:
 #define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 5000/1023 == 4643mV)
 
 #define DEFAULT_TARGET (133U)      // 133 * 5000 / 1023 == 650mV
+#define ANTI_WINDUP_MS (128+32)    // how many "millis()" to wait between updating the pwm. Recall to scale by 64 due to prescaling (160 == 2.5ms which seems to work for me)
 
 #define TRAINING_LOOPS 4 // how many times do we average the training adc value before stopping
 
@@ -212,32 +200,89 @@ void store_target(unsigned target)
 // adjust the PWM to target the target_adc
 void update_pwm()
 {
-  int new_pwm, delta;
-  unsigned sum;
-  unsigned char x;
+  static int last_adc = 0;
+  static unsigned long last_sample_time = 0;
+  static byte persistent_error_timer = 0;
+  int new_pwm, delta, slope;
 
+  // read the ADC and compute delta
   current_adc = analogRead(PIN_ADC);
-  delta = (int)current_adc - (int)target_adc; // how far off are we in steps of 5000mV / 1023 == 4.88mV
-  integral_sum += delta;
+  delta = (int)current_adc - (int)target_adc;
+
+  // we want to only update the PWM signal ever ANTI_WINDUP_MS window
+  // though there are times we're way off base we might want to update sooner
+
+  // DYNAMIC TIMING:
+  // If the error is huge (>100mV), bypass the wait and react now!
+  // Otherwise, use the standard "stable" window.
+  bool urgent = (abs(delta) > 20);  
+
+  if (!urgent && millis() - last_sample_time < (ANTI_WINDUP_MS)) return;
+  last_sample_time = millis();
+
+  slope = (int)current_adc - last_adc;
+  last_adc = current_adc;
+
   new_pwm = (int)cur_pwm;
 
-  // adjust signed pwm count
-  new_pwm += (delta >> 1);
-
-  // saturate the integral error so we avoid winding up too hard
-  if (integral_sum > 255) {
-    integral_sum = 255;
-  } else if (integral_sum < -256) {
-    integral_sum = -256;
+  // 1. DAMPING (D-Term)
+  // We apply the "Brake" first to stabilize the slope.
+  if (slope > 1) {
+    new_pwm += 1;
   }
-  new_pwm += (integral_sum + 128) >> 8;
+  if (slope < -1) {
+    new_pwm -= 1;
+  }
 
-  // saturate the PWM value
+  // 2. SMART DEADZONE & HYSTERESIS
+  if (abs(delta) > 4) {
+    // Proportional move for significant errors
+    if (delta > 0) {
+      new_pwm += 1; 
+    } else {
+      new_pwm -= 1;
+    }
+    persistent_error_timer = 0; // Reset timer
+  } else if (abs(delta) >= 2) {
+    // For small errors, don't jitter. Only nudge if it stays off-target.
+    persistent_error_timer++;
+    if (persistent_error_timer > 3) { 
+        if (delta > 0) {
+          new_pwm += 1;
+        } else {
+          new_pwm -= 1;
+        }
+        persistent_error_timer = 0;
+    }
+  } else {
+    persistent_error_timer = 0;
+  }
+
+  // 3. INTEGRAL (Fine Tuning)
+  // We only let the integral work when we are very close to target.
+  if (abs(delta) < 10) {
+    integral_sum += delta;
+  } else {
+    integral_sum = (integral_sum * 1) / 2; // Quickly bleed off integral if error is large
+  }
+  
+  if (integral_sum > 120) {
+    new_pwm += 1;
+    integral_sum = 0;
+  }
+  if (integral_sum < -120) {
+    new_pwm -= 1;
+    integral_sum = 0;
+  }
+
+  // Saturate
   if (new_pwm > 255) {
     new_pwm = 255;
-  } else if (new_pwm < 0) {
+  }
+  if (new_pwm < 0) {
     new_pwm = 0;
   }
+  
   cur_pwm = new_pwm;
   OCR0A = cur_pwm;
 }
