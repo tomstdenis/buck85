@@ -7,14 +7,6 @@ NOTE:  YOU MUST USE THE BOD 4.3V TARGET FOR THIS TO WORK CORRECTLY.
 It uses a roughly 5:1 divider on PIN_ADC so we can map 5 volts to below the 1.1 internal reference
 voltage.
 
-The buck converter starts in a "pre gen" phase where it tries to output roughly 500mV for 150ms.
-If it can't or it detects a short (because PIN_ADC reads below TOO_LOW) it goes into a fault state.
-If it can hold it it goes into "gen" mode where it tries to output the stored value.
-
-If a fault is detected during "pre gen" or "gen" phases it goes into fault state.  Where it
-turns off the mosfet, waits 1 second, then goes back into "pre gen" mode trying to output 500mV.  This 
-lets it "self recover" from intermittent shorts or excessive loads.
-
 if PIN_CONFIG is grounded it goes into "config mode" where it reads PIN_ADC and averages it into
 a running total.  Once PIN_CONFIG goes high again it stores the trained ADC value in EEPROM and 
 goes into "pre gen" mode.
@@ -212,6 +204,7 @@ void update_pwm()
 
   for (sum = x = 0; x < ADC_AVERAGE; x++) {
     sum += analogRead(PIN_ADC);
+    delayMicroseconds(8); // at 31.25KHz PWM a full cycle is 32uS so we read across multiple quadrants of the wave
   }
   sum >>= ADC_AVERAGE_BITS;
   current_adc = sum;
@@ -324,8 +317,8 @@ void loop()
       training_adc = 0;
       training_cnt = 0;
       training_loop = 0;
-      digitalWrite(PIN_PWM, HIGH); // turn off mosfet
-      delay(150*64); // wait 150mS before sampling
+      analogWrite(PIN_PWM, 255); // turn off MOSFET
+      delay(250*64); // wait 250mS before sampling to let any stored inductance to dissipate
       TCCR0B = (TCCR0B & 0xF8) | 0x00; // Stop Timer0 (Clock source = No clock)
     }
   }
@@ -361,6 +354,7 @@ void loop()
       if (digitalRead(PIN_CONFIG) == LOW) {
         if (training_loop < TRAINING_LOOPS) {
           training_adc += analogRead(PIN_ADC);
+          delayMicroseconds(50); // delay to let ADC settle before next sample
           if (++training_cnt == 32) {
             training_adc >>= 5;
             training_cnt = 0;
