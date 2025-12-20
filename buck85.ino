@@ -227,6 +227,22 @@ void update_pwm()
   if (ramped_adc < target_adc) ramped_adc++;
   else if (ramped_adc > target_adc) ramped_adc--;
 
+  if (current_adc > ramped_adc + 25) { 
+      // Massive overshoot detected! 
+      // Clear history to middle-ground to drop duty cycle immediately
+      for (int i = 0; i < 256; i++) hist[i] = 0x88; 
+      control_effort -= (64<<8); // Hard drop to PWM effort
+      if (control_effort < 256) {
+        control_effort = 256;
+      }
+  } else if (ramped_adc > current_adc + 25) {
+    // massive undershoot
+    control_effort += (4<<8);
+    if (control_effort > 65024L) {
+      control_effort = 65024L;
+    }
+  }
+
   // 3. History Indexing & Table Update (Using notched signal)
   if (abs(current_adc - ramped_adc) > 1) {
     hist_idx = ((hist_idx << 1) | (current_adc < ramped_adc)) & 0x1FF;
