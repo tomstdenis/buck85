@@ -7,7 +7,7 @@
  * * DESCRIPTION:
  * A software-controlled DC-DC Buck Converter using an ATtiny85. It features a 
  * "Training Mode" to set target voltages via an external reference and uses a 
- * PID-lite control loop to maintain stability under load.
+ * linear + non-linear control loop to maintain stability under load.
  * * SAFETY NOTE: 
  * You MUST program the ATtiny85 with BOD (Brown-Out Detection) set to 4.3V 
  * to ensure the MOSFET shuts down safely during power loss.
@@ -67,9 +67,13 @@
 
 #define TOO_LOW 13                 // anything below 64mV is considered a short (13 * 5000/1023 == 63.53mV)
 #define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 5000/1023 == 4643mV)
-
 #define DEFAULT_TARGET (133U)      // 133 * 5000 / 1023 == 650mV
-#define ANTI_WINDUP_MS (128+32)    // how many "millis()" to wait between updating the pwm. Recall to scale by 64 due to prescaling (160 == 2.5ms which seems to work for me)
+#define MIN_HIST_HAM (153)         // 30% of 512
+
+#define NLINEAR_GAIN (4)              // gain of history nibble 0..7 * 16 (basically 0 to 0.5 of a PWM step)
+#define LINEAR_GAIN (8)
+#define L_RATIO (5)                // how many out of 8 is the linear prediction worth
+#define NL_RATIO (8 - L_RATIO)
 
 #define TRAINING_LOOPS 4 // how many times do we average the training adc value before stopping
 
@@ -77,13 +81,22 @@ enum {
    FSM_GEN,
    FSM_GEN_FAULT, // turn off mosfet to disable output because we detected a fault
    FSM_CONFIG_SENSE, // sense and average the ADC code 
+   FSM_CONFIG_SENSE_WAIT, // initial startup waiting for training to start
    FSM_WAIT_RECOVERY, // state to enter when fault occurs
 };
 
-unsigned char training_loop, fsm_state, cur_pwm = 224, training_cnt = 0; // set cur_pwm to mostly on because it's a P-channel so a HIGH means turn the mosfet off
+// Timing and System Variables
+volatile unsigned long control_ticks = 0;  // Increments every 128us
+volatile long control_effort = 224L << 8;  // Start duty (scaled by 256)
+
+volatile unsigned char 
+  training_loop,
+  fsm_state,
+  training_cnt,
+  hist[256];
+volatile unsigned hist_idx;
 unsigned long pre_gen_time;
-unsigned current_adc, target_adc, training_adc = 0;
-int integral_sum = 0; // accumulated error over time
+volatile int ramped_adc, current_adc, target_adc, training_adc = 0;
 
 #ifdef DEBUG
 #define TX_PIN PIN_DEBUG
@@ -99,7 +112,7 @@ int integral_sum = 0; // accumulated error over time
 void tinySerial_begin() {
   pinMode(TX_PIN, OUTPUT);
   digitalWrite(TX_PIN, HIGH); // Line is HIGH when idle
-  delay(5*64UL); // Small startup delay
+  delayMicroseconds(5000); // Small startup delay
 }
 
 // Sends a single byte (non-blocking when called)
@@ -197,107 +210,95 @@ void store_target(unsigned target)
   EEPROM.write(0, 0xA5);
 }
 
-// adjust the PWM to target the target_adc
+// PWM TIMER interrupt, this fires every 32uS (31.25KHz)
+ISR(TIM0_OVF_vect) {
+    control_ticks++;
+}
+
 void update_pwm()
 {
-  static int last_adc = 0;
-  static unsigned long last_sample_time = 0;
-  static byte persistent_error_timer = 0;
-  int new_pwm, delta, slope;
-
-  // read the ADC and compute delta
-  current_adc = analogRead(PIN_ADC);
-  delta = (int)current_adc - (int)target_adc;
-
-  // we want to only update the PWM signal ever ANTI_WINDUP_MS window
-  // though there are times we're way off base we might want to update sooner
-
-  // DYNAMIC TIMING:
-  // If the error is huge (>100mV), bypass the wait and react now!
-  // Otherwise, use the standard "stable" window.
-  bool urgent = (abs(delta) > 20);  
-
-  if (!urgent && millis() - last_sample_time < (ANTI_WINDUP_MS)) return;
-  last_sample_time = millis();
-
-  slope = (int)current_adc - last_adc;
-  last_adc = current_adc;
-
-  new_pwm = (int)cur_pwm;
-
-  // 1. DAMPING (D-Term)
-  // We apply the "Brake" first to stabilize the slope.
-  if (slope > 1) {
-    new_pwm += 1;
-  }
-  if (slope < -1) {
-    new_pwm -= 1;
+  if (fsm_state != FSM_GEN || (ADCSRA & _BV(ADSC))) {
+    return;
   }
 
-  // 2. SMART DEADZONE & HYSTERESIS
-  if (abs(delta) > 4) {
-    // Proportional move for significant errors
-    if (delta > 0) {
-      new_pwm += 1; 
-    } else {
-      new_pwm -= 1;
+  // 1. NYQUIST NOTCH FILTER (Kills 3.9kHz dead)
+  int current_adc = ADCW;
+
+  // 2. Soft Target Ramping
+  if (ramped_adc < target_adc) ramped_adc++;
+  else if (ramped_adc > target_adc) ramped_adc--;
+
+  // 3. History Indexing & Table Update (Using notched signal)
+  if (abs(current_adc - ramped_adc) > 1) {
+    hist_idx = ((hist_idx << 1) | (current_adc < ramped_adc)) & 0x1FF;
+  }
+
+  uint16_t byte_idx = hist_idx >> 1;
+  uint8_t raw_byte = hist[byte_idx];
+  uint8_t nibble = (hist_idx & 1) ? (raw_byte >> 4) : (raw_byte & 0x0F);
+  uint8_t old_nibble = nibble;
+
+  if (current_adc < ramped_adc && nibble < 15) nibble++;
+  else if (current_adc > ramped_adc && nibble > 0) nibble--;
+
+  if (hist_idx & 1) hist[byte_idx] = (raw_byte & 0x0F) | (nibble << 4);
+  else             hist[byte_idx] = (raw_byte & 0xF0) | nibble;
+
+  // 4. Hybrid Control Execution
+  long delta = 0;
+
+  if (current_adc < ramped_adc) {
+    delta = (long)L_RATIO * LINEAR_GAIN;
+    if (nibble > 8) {
+      delta += (long)NL_RATIO * NLINEAR_GAIN;
     }
-    persistent_error_timer = 0; // Reset timer
-  } else if (abs(delta) >= 2) {
-    // For small errors, don't jitter. Only nudge if it stays off-target.
-    persistent_error_timer++;
-    if (persistent_error_timer > 3) { 
-        if (delta > 0) {
-          new_pwm += 1;
-        } else {
-          new_pwm -= 1;
-        }
-        persistent_error_timer = 0;
+  } else if (current_adc > ramped_adc) {
+    delta = (long)L_RATIO * -LINEAR_GAIN;
+    if (nibble < 8) {
+      delta -= (long)NL_RATIO * NLINEAR_GAIN;
     }
-  } else {
-    persistent_error_timer = 0;
   }
+  delta >>= 3; // Normalize ratio
 
-  // 3. INTEGRAL (Fine Tuning)
-  // We only let the integral work when we are very close to target.
-  if (abs(delta) < 10) {
-    integral_sum += delta;
-  } else {
-    integral_sum = (integral_sum * 1) / 2; // Quickly bleed off integral if error is large
-  }
-  
-  if (integral_sum > 120) {
-    new_pwm += 1;
-    integral_sum = 0;
-  }
-  if (integral_sum < -120) {
-    new_pwm -= 1;
-    integral_sum = 0;
-  }
+  // 5. Apply, Clamp & Update Output
+  long new_effort = (long)control_effort + delta;
+  if (new_effort > 65024L) new_effort = 65024L;
+  if (new_effort < 256L)   new_effort = 256L;
+  control_effort = new_effort;
 
-  // Saturate
-  if (new_pwm > 255) {
-    new_pwm = 255;
-  }
-  if (new_pwm < 0) {
-    new_pwm = 0;
-  }
-  
-  cur_pwm = new_pwm;
-  OCR0A = cur_pwm;
+  OCR0A = 255 - (uint8_t)(control_effort >> 8);
+  ADCSRA |= (1 << ADSC); 
 }
 
 void setup_gen()
 {
-  integral_sum = 0;
-  fsm_state = FSM_GEN; // go back to pre-gen phase
+  cli(); // Disable interrupts while resetting state
+  
+  fsm_state = FSM_GEN; 
   load_target();
-  cur_pwm = 255; // start with the MOSFET fully off
-  OCR0A = cur_pwm;
-  delay(25*64);
+  
+  // 1. Reset non-linear history
+  unsigned x;
+  for (x = 0; x < 256; x++) {
+    hist[x] = 0x88; // middle value in both nibbles
+  }
+  hist_idx = 0;
+  
+  // 2. Start with MOSFET fully OFF (Effort 0 = OCR0A 255)
+  control_effort = 0;
+  ramped_adc = 32; // initially target a low voltage and climb to the real target
+  OCR0A = 255; 
+
+  // 3. Ensure ADC is ready and kick off the first sample
+  ADCSRA |= _BV(ADEN)| _BV(ADSC); 
+
+  sei(); // Re-enable interrupts
+  delayMicroseconds(50000); // Give the LC filter a moment to settle
 }
 
 void setup() {
+  cli();
+
   TCCR1 &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12) | _BV(CS13)); // Stop Timer1
 
 #ifdef DEBUG  
@@ -305,7 +306,8 @@ void setup() {
   tinySerial_println(PSTR("\r\n\r\nHello from Buck85\r\n"));
 #endif
 #ifdef DEBUG_PWM
-  pinMode(PIN_DEBUG, OUTPUT);
+  DDRB |= (1 << PIN_DEBUG);
+  PORTB &= ~(1 << PIN_DEBUG);
 #endif
 
   // disable the mosfet
@@ -317,18 +319,30 @@ void setup() {
   TCCR0A = _BV(COM0A1) | _BV(WGM01) | _BV(WGM00);
 
   // 3. Set the frequency (Prescaler)
-  // Your original code used (TCCR0B & 0xF8) | 0x01 which is "No Prescaling"
   TCCR0B = (TCCR0B & 0xF8) | 0x01; 
 
   // 4. Initial state: OFF for P-Channel (255 = Gate High)
-  OCR0A = 255;
+  control_effort = 0 << 8;
+  ramped_adc = 32;
+  OCR0A = 255 - ((control_effort) >> 8);
  
   // configure config pin
   pinMode(PIN_CONFIG, INPUT_PULLUP);
 
   // configure ADC to use internal ref
   pinMode(PIN_ADC, INPUT);
-  analogReference(INTERNAL);
+
+  // Prescaler 64 is binary 110 (ADPS2=1, ADPS1=1, ADPS0=0)
+  ADCSRA &= ~(_BV(ADPS0)); // Clear ADPS0
+  ADCSRA |= _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1); // Set ADPS2 and ADPS1 and ADEN
+  ADMUX = _BV(REFS1) | _BV(MUX1);
+
+  // Trigger NEXT ADC Conversion
+  ADCSRA |= (1 << ADSC);
+
+  // Enable Timer0 Overflow Interrupt
+  TIMSK |= _BV(TOIE0);
+  sei();
 
   // configure EEPROM
   if (EEPROM.read(0) != 0xA5) {
@@ -356,24 +370,22 @@ void loop()
   }
 #endif
 #ifdef DEBUG_PWM
-  analogWrite(PIN_DEBUG, 48 * (1 + fsm_state));
+  OCR1B = 32 * (1 + fsm_state);
 #endif  
   // detect config pin...
   if (fsm_state != FSM_CONFIG_SENSE && digitalRead(PIN_CONFIG) == LOW) {
     // wait 25ms to make sure it's really low
-    delay(25*64);
+    delayMicroseconds(25000);
     if (digitalRead(PIN_CONFIG) == LOW) {
 #ifdef DEBUG
       tinySerial_println(PSTR("Going into FSM_CONFIG_SENSE mode..."));
 #endif      
-      fsm_state = FSM_CONFIG_SENSE;
+      fsm_state = FSM_CONFIG_SENSE_WAIT;
       training_adc = 0;
       training_cnt = 0;
       training_loop = 0;
       OCR0A = 255;
-      delay(500*64);
-      delay(500*64); // wait before sampling to let any stored inductance to dissipate
-      TCCR0B = (TCCR0B & 0xF8) | 0x00; // Stop Timer0 (Clock source = No clock)
+      pre_gen_time = control_ticks + 32000U; // 1s of 8 ticks per ms
     }
   }
 
@@ -383,7 +395,7 @@ void loop()
       update_pwm();
       if (current_adc < TOO_LOW) {
         // a short occured jump to FSM_GEN_FAULT
-        fsm_state = FSM_GEN_FAULT;
+        //fsm_state = FSM_GEN_FAULT;
 #ifdef DEBUG
         tinySerial_println(PSTR("Going from FSM_GEN to FSM_GEN_FAULT because ADC was too low."));
 #endif
@@ -391,23 +403,31 @@ void loop()
       break;
     case FSM_GEN_FAULT:
       // a fault occurred, so let's sleep for a second, reset to 0.5V and try again
-      OCR0A = 255;
+      control_effort = 255 << 8;
+      OCR0A = control_effort >> 8;
       fsm_state = FSM_WAIT_RECOVERY;
-      pre_gen_time = millis() + 64000; // 64x prescaler * 1000ms
+      pre_gen_time = control_ticks + 32000U; // 1000ms of 1 tick/128uS == 1000 * 8/ms
       break;
     case FSM_WAIT_RECOVERY:
-      if (millis() > pre_gen_time) {
+      if (control_ticks >= pre_gen_time) {
           setup_gen();
 #ifdef DEBUG
           tinySerial_println(PSTR("Going from FSM_WAIT_RECOVERY back to FSM_GEN"));
 #endif
       }
       break;
+    case FSM_CONFIG_SENSE_WAIT:
+      if (control_ticks >= pre_gen_time) {
+        fsm_state = FSM_CONFIG_SENSE;
+      }
+      break;
     case FSM_CONFIG_SENSE:
       // if the pin is still low read the ADC and average
       if (digitalRead(PIN_CONFIG) == LOW) {
         if (training_loop < TRAINING_LOOPS) {
-          training_adc += analogRead(PIN_ADC);
+          ADCSRA |= (1 << ADSC);
+          while (ADCSRA & (1 << ADSC));
+          training_adc += ADCW;
           delayMicroseconds(50); // delay to let ADC settle before next sample
           if (++training_cnt == 32) {
             training_adc >>= 5;
@@ -416,9 +436,8 @@ void loop()
           }
         }
       } else {
-        // pin is HIGH let's ensure it stays high for 10ms and then store
-        TCCR0B = (TCCR0B & 0xF8) | 0x01; // turn TIMER0 back on
-        delay(25*64);
+        // pin is HIGH let's ensure it stays high for 25ms and then store
+        delayMicroseconds(25000);
         if (digitalRead(PIN_CONFIG) == HIGH) {
           // pin still high so let's assume it was released and store the trained data
           // only store valid training data
