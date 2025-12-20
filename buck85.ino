@@ -68,11 +68,10 @@
 #define TOO_LOW 13                 // anything below 64mV is considered a short (13 * 5000/1023 == 63.53mV)
 #define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 5000/1023 == 4643mV)
 #define DEFAULT_TARGET (133U)      // 133 * 5000 / 1023 == 650mV
-#define MIN_HIST_HAM (153)         // 30% of 512
 
 #define NLINEAR_GAIN (4)           // non-linear gain
 #define LINEAR_GAIN (8)            // linear gain
-#define L_RATIO (160)              // linear weight, 160/256 == 5/8ths
+#define L_RATIO (192)              // linear weight (out of 256)
 #define NL_RATIO (256 - L_RATIO)   // non-linear weight
 
 #define TRAINING_LOOPS 4 // how many times do we average the training adc value before stopping
@@ -257,6 +256,7 @@ void update_pwm()
       delta -= (long)NL_RATIO * NLINEAR_GAIN;
     }
   }
+  delta >>= 8;
 
   // 5. Apply, Clamp & Update Output
   long new_effort = (long)control_effort + delta;
