@@ -70,10 +70,10 @@
 #define DEFAULT_TARGET (133U)      // 133 * 5000 / 1023 == 650mV
 #define MIN_HIST_HAM (153)         // 30% of 512
 
-#define NLINEAR_GAIN (4)              // gain of history nibble 0..7 * 16 (basically 0 to 0.5 of a PWM step)
-#define LINEAR_GAIN (8)
-#define L_RATIO (5)                // how many out of 8 is the linear prediction worth
-#define NL_RATIO (8 - L_RATIO)
+#define NLINEAR_GAIN (4)           // non-linear gain
+#define LINEAR_GAIN (8)            // linear gain
+#define L_RATIO (160)              // linear weight, 160/256 == 5/8ths
+#define NL_RATIO (256 - L_RATIO)   // non-linear weight
 
 #define TRAINING_LOOPS 4 // how many times do we average the training adc value before stopping
 
@@ -221,7 +221,7 @@ void update_pwm()
     return;
   }
 
-  // 1. NYQUIST NOTCH FILTER (Kills 3.9kHz dead)
+  // 1. read ADC
   int current_adc = ADCW;
 
   // 2. Soft Target Ramping
@@ -246,7 +246,6 @@ void update_pwm()
 
   // 4. Hybrid Control Execution
   long delta = 0;
-
   if (current_adc < ramped_adc) {
     delta = (long)L_RATIO * LINEAR_GAIN;
     if (nibble > 8) {
@@ -258,7 +257,6 @@ void update_pwm()
       delta -= (long)NL_RATIO * NLINEAR_GAIN;
     }
   }
-  delta >>= 3; // Normalize ratio
 
   // 5. Apply, Clamp & Update Output
   long new_effort = (long)control_effort + delta;
