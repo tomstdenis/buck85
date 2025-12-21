@@ -69,9 +69,10 @@
 #define TOO_HIGH 950               // anything above is considered illsuited for the circuit(950 * 5000/1023 == 4643mV)
 #define DEFAULT_TARGET (133U)      // 133 * 5000 / 1023 == 650mV
 
-#define NLINEAR_GAIN (4)           // non-linear gain
-#define LINEAR_GAIN (8)            // linear gain
+#define LINEAR_GAIN (32)           // linear gain
 #define L_RATIO (192)              // linear weight (out of 256)
+
+#define NLINEAR_GAIN (8)           // non-linear gain
 #define NL_RATIO (256 - L_RATIO)   // non-linear weight
 
 // use Timer1 for 64MHz
@@ -232,7 +233,6 @@ void store_target(unsigned target)
 ISR(TIM0_OVF_vect) {
 #else
 // PWM TIMER1 interrupt, this fires every 16uS (62.5KHz)
-// TODO: fill in vector name for Timer1 overflow
 ISR(TIMER1_OVF_vect) {
 #endif
     control_ticks++;
@@ -251,24 +251,24 @@ void update_pwm()
   if (ramped_adc < target_adc) ramped_adc++;
   else if (ramped_adc > target_adc) ramped_adc--;
 
-  if (current_adc > ramped_adc + 25) { 
-      // Massive overshoot detected! 
-      control_effort -= (64<<8); // Hard drop to PWM effort
-      if (control_effort < 0) {
-        control_effort = 0;
+  if (ramped_adc == target_adc) {
+    if (current_adc > ramped_adc + 15) { 
+        // Massive overshoot detected! 
+        control_effort -= (((current_adc - ramped_adc) >> 4) << 8); // Hard drop to PWM effort
+        if (control_effort < 0) {
+          control_effort = 0;
+        }
+    } else if (ramped_adc > current_adc + 15) {
+      // massive undershoot
+        control_effort += (((ramped_adc - current_adc) >> 4) << 8); // Hard drop to PWM effort
+      if (control_effort > 65280) {
+        control_effort = 65280;
       }
-  } else if (ramped_adc > current_adc + 25) {
-    // massive undershoot
-    control_effort += (4<<8);
-    if (control_effort > 65024L) {
-      control_effort = 65024L;
     }
   }
 
-  // 3. History Indexing & Table Update (Using notched signal)
-  if (abs(current_adc - ramped_adc) > 1) {
-    hist_idx = ((hist_idx << 1) | (current_adc < ramped_adc)) & 0x1FF;
-  }
+  // 3. History Indexing & Table Update
+  hist_idx = ((hist_idx << 1) | (current_adc < ramped_adc)) & 0x1FF;
 
   uint16_t byte_idx = hist_idx >> 1;
   uint8_t raw_byte = hist[byte_idx];
@@ -298,11 +298,11 @@ void update_pwm()
 
   // 5. Apply, Clamp & Update Output
   long new_effort = (long)control_effort + delta;
-  if (new_effort > 65024L) new_effort = 65024L;
+  if (new_effort > 65280) new_effort = 65280;
   if (new_effort < 0L)   new_effort = 0L;
   control_effort = new_effort;
 
-  PWM_CTR_REG = EFFORT_TO_PWM((uint8_t)(control_effort >> 8));
+  PWM_CTR_REG = EFFORT_TO_PWM((uint8_t)((control_effort + 128) >> 8));
   ADCSRA |= (1 << ADSC); 
 }
 
@@ -389,7 +389,7 @@ void setup() {
 
   // 5. Initial state: OFF for P-Channel (255 = Gate High)
   control_effort = 0 << 8;
-  ramped_adc = 32;
+  ramped_adc = 16;
   PWM_CTR_REG = EFFORT_TO_PWM((control_effort) >> 8);
 
   // configure config pin
