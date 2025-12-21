@@ -77,6 +77,18 @@
 
 // use Timer1 for 64MHz
 #define USE_TIMER1
+#ifdef USE_TIMER1
+
+// 31.25kHz, (62.5kHz), 125kHz, and 250kHz options for TIMER1
+#define USE_TIMER1_31KHZ           (_BV(CS12))
+#define USE_TIMER1_62KHZ           (_BV(CS11)|_BV(CS10))
+#define USE_TIMER1_125KHZ          (_BV(CS11))
+#define USE_TIMER1_250KHZ          (_BV(CS10))
+
+// select which clock to use (default is 62.5kHz which seems to be the sweet spot for the components listed above)
+#define TIMER_1_CLOCK USE_TIMER1_62KHZ
+#endif
+
 
 // can't use Timer1 if debuging is enabled because Timer1 will be outputting to OC1A and !OC1A pins (PB1 and PB0)
 #if defined(DEBUG) || defined(DEBUG_PWM)
@@ -252,15 +264,18 @@ void update_pwm()
   else if (ramped_adc > target_adc) ramped_adc--;
 
   if (ramped_adc == target_adc) {
+    // if we're off by more than 15 ADC codes (5V/1024 => 78mV) then kick it porportionally
+    // ADC is 10-bit and PWM is 8-bit so we need to >>2 to keep 1:1
+    // here we divide further by 4 so the kick is 1/4th the error to avoid violently overshooting hence >>4 
     if (current_adc > ramped_adc + 15) { 
         // Massive overshoot detected! 
-        control_effort -= (((current_adc - ramped_adc) >> 4) << 8); // Hard drop to PWM effort
+        control_effort -= (((current_adc - ramped_adc) >> 4) << 8);
         if (control_effort < 0) {
           control_effort = 0;
         }
     } else if (ramped_adc > current_adc + 15) {
       // massive undershoot
-        control_effort += (((ramped_adc - current_adc) >> 4) << 8); // Hard drop to PWM effort
+        control_effort += (((ramped_adc - current_adc) >> 4) << 8);
       if (control_effort > 65280) {
         control_effort = 65280;
       }
@@ -374,8 +389,7 @@ void setup() {
   // PWM1A = 1: Enable PWM mode based on comparator OCR1A
   // COM1A0 = 1: Inverted Mode (Clear on Match, Set at Bottom, but inverted output)
   // This means as OCR1A increases, the pin spends MORE time LOW (ON for P-CH)
-  TCCR1 = _BV(PWM1A) | _BV(COM1A0) | _BV(CS11) | _BV(CS10); 
-  // CS11|CS10 = Prescaler /4. Result: 64MHz / 4 / 256 = 62.5kHz
+  TCCR1 = _BV(PWM1A) | _BV(COM1A0) | TIMER_1_CLOCK;
 
   // 3. Disable Timer0 to save power/cycles (Optional since we use Timer1 ticks now)
   TCCR0B = 0; 
