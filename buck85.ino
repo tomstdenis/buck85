@@ -75,9 +75,16 @@
 #define NLINEAR_GAIN (8)           // non-linear gain
 #define NL_RATIO (256 - L_RATIO)   // non-linear weight
 
-// use Timer1 for 64MHz
+// use Timer1 with 64MHz PLL for higher clock rate PWM
 #define USE_TIMER1
 
+// can't use Timer1 if debuging is enabled because Timer1 will be outputting to OC1A and !OC1A pins (PB1 and PB0)
+#if defined(USE_TIMER1) && (defined(DEBUG) || defined(DEBUG_PWM))
+#warning Switching back to Timer0 since DEBUG or DEBUG_PWM is enabled and would clash with OC1A signal driving PB1
+#undef USE_TIMER1
+#endif
+
+// Clock selection if you're using Timer1
 #ifdef USE_TIMER1
 
 // select which clock to use (default is 62.5kHz which seems to be the sweet spot for the components listed above)
@@ -105,11 +112,6 @@
 
 #endif
 
-
-// can't use Timer1 if debuging is enabled because Timer1 will be outputting to OC1A and !OC1A pins (PB1 and PB0)
-#if defined(DEBUG) || defined(DEBUG_PWM)
-#undef USE_TIMER1
-#endif
 
 #ifndef USE_TIMER1
 #define MS_TO_TICKS(x) ((x) * 31L)      // 32us period means there are about 32 ticks per ms
