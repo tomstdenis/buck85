@@ -253,11 +253,9 @@ void update_pwm()
 
   if (current_adc > ramped_adc + 25) { 
       // Massive overshoot detected! 
-      // Clear history to middle-ground to drop duty cycle immediately
-      for (int i = 0; i < 256; i++) hist[i] = 0x88; 
       control_effort -= (64<<8); // Hard drop to PWM effort
-      if (control_effort < 256) {
-        control_effort = 256;
+      if (control_effort < 0) {
+        control_effort = 0;
       }
   } else if (ramped_adc > current_adc + 25) {
     // massive undershoot
@@ -301,7 +299,7 @@ void update_pwm()
   // 5. Apply, Clamp & Update Output
   long new_effort = (long)control_effort + delta;
   if (new_effort > 65024L) new_effort = 65024L;
-  if (new_effort < 256L)   new_effort = 256L;
+  if (new_effort < 0L)   new_effort = 0L;
   control_effort = new_effort;
 
   PWM_CTR_REG = EFFORT_TO_PWM((uint8_t)(control_effort >> 8));
@@ -336,7 +334,6 @@ void setup_gen()
 
 void setup() {
   cli();
-
 
 #ifdef DEBUG  
   tinySerial_begin();
@@ -451,7 +448,7 @@ void loop()
       training_adc = 0;
       training_cnt = 0;
       training_loop = 0;
-      PWM_CTR_REG = EFFORT_TO_PWM(255);
+      PWM_CTR_REG = EFFORT_TO_PWM(0);
       pre_gen_time = control_ticks + MS_TO_TICKS(1000);
     }
   }
