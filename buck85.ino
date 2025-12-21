@@ -77,6 +77,7 @@
 
 // use Timer1 for 64MHz
 #define USE_TIMER1
+
 #ifdef USE_TIMER1
 
 // 31.25kHz, (62.5kHz), 125kHz, and 250kHz options for TIMER1
@@ -86,7 +87,24 @@
 #define USE_TIMER1_250KHZ          (_BV(CS10))
 
 // select which clock to use (default is 62.5kHz which seems to be the sweet spot for the components listed above)
+#define TIMER1_OPTION 1
+
+#if TIMER1_OPTION == 0
+#define MS_TO_TICKS(x) ((x) * 31L)
+#define TIMER_1_CLOCK USE_TIMER1_31KHZ
+#elif TIMER1_OPTION == 1
+#define MS_TO_TICKS(x) ((x) * 62L)
 #define TIMER_1_CLOCK USE_TIMER1_62KHZ
+#elif TIMER1_OPTION == 2
+#define MS_TO_TICKS(x) ((x) * 125L)
+#define TIMER_1_CLOCK USE_TIMER1_125KHZ
+#elif TIMER1_OPTION == 3
+#define MS_TO_TICKS(x) ((x) * 256L)
+#define TIMER_1_CLOCK USE_TIMER1_250KHZ
+#else
+#error TIMER1_OPTION not defined or not valid must be 0, 1, 2, or 3.
+#endif
+
 #endif
 
 
@@ -100,7 +118,6 @@
 #define EFFORT_TO_PWM(x) (255 - (x))   // normal PWM with a P-CH we want LOW for ON
 #define PWM_CTR_REG OCR0A              // Timer Compare Register
 #else
-#define MS_TO_TICKS(x) ((x) * 64)      // 16us period means there are about 64 ticks per ms
 #define EFFORT_TO_PWM(x) ((x))         // inverted OC1A PWM with a P-CH we want HIGH for ON
 #define PWM_CTR_REG OCR1A              // Timer Compare Register
 #endif
