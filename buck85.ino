@@ -74,6 +74,24 @@
 #define L_RATIO (192)              // linear weight (out of 256)
 #define NL_RATIO (256 - L_RATIO)   // non-linear weight
 
+// use Timer1 for 64MHz
+#define USE_TIMER1
+
+// can't use Timer1 if debuging is enabled because Timer1 will be outputting to OC1A and !OC1A pins (PB1 and PB0)
+#if defined(DEBUG) || defined(DEBUG_PWM)
+#undef USE_TIMER1
+#endif
+
+#ifndef USE_TIMER1
+#define MS_TO_TICKS(x) ((x) * 32)      // 32us period means there are about 32 ticks per ms
+#define EFFORT_TO_PWM(x) (255 - (x))   // normal PWM with a P-CH we want LOW for ON
+#define PWM_CTR_REG OCR0A              // Timer Compare Register
+#else
+#define MS_TO_TICKS(x) ((x) * 64)      // 16us period means there are about 64 ticks per ms
+#define EFFORT_TO_PWM(x) ((x))         // inverted OC1A PWM with a P-CH we want HIGH for ON
+#define PWM_CTR_REG OCR1A              // Timer Compare Register
+#endif
+
 #define TRAINING_LOOPS 4 // how many times do we average the training adc value before stopping
 
 enum {
@@ -85,17 +103,17 @@ enum {
 };
 
 // Timing and System Variables
-volatile unsigned long control_ticks = 0;  // Increments every 128us
-volatile long control_effort = 224L << 8;  // Start duty (scaled by 256)
+volatile unsigned long control_ticks = 0;  // Increments every PWM period (32us(Timer0) or 16us(Timer1))
+long control_effort = 224L << 8;  // Start duty (scaled by 256)
 
-volatile unsigned char 
+unsigned char 
   training_loop,
   fsm_state,
   training_cnt,
   hist[256];
-volatile unsigned hist_idx;
+unsigned hist_idx;
 unsigned long pre_gen_time;
-volatile int ramped_adc, current_adc, target_adc, training_adc = 0;
+int ramped_adc, current_adc, target_adc, training_adc = 0;
 
 #ifdef DEBUG
 #define TX_PIN PIN_DEBUG
@@ -209,8 +227,14 @@ void store_target(unsigned target)
   EEPROM.write(0, 0xA5);
 }
 
-// PWM TIMER interrupt, this fires every 32uS (31.25KHz)
+#ifndef USE_TIMER1
+// PWM TIMER0 interrupt, this fires every 32uS (31.25KHz)
 ISR(TIM0_OVF_vect) {
+#else
+// PWM TIMER1 interrupt, this fires every 16uS (62.5KHz)
+// TODO: fill in vector name for Timer1 overflow
+ISR(TIMER1_OVF_vect) {
+#endif
     control_ticks++;
 }
 
@@ -280,7 +304,7 @@ void update_pwm()
   if (new_effort < 256L)   new_effort = 256L;
   control_effort = new_effort;
 
-  OCR0A = 255 - (uint8_t)(control_effort >> 8);
+  PWM_CTR_REG = EFFORT_TO_PWM((uint8_t)(control_effort >> 8));
   ADCSRA |= (1 << ADSC); 
 }
 
@@ -301,7 +325,7 @@ void setup_gen()
   // 2. Start with MOSFET fully OFF (Effort 0 = OCR0A 255)
   control_effort = 0;
   ramped_adc = 32; // initially target a low voltage and climb to the real target
-  OCR0A = 255; 
+  PWM_CTR_REG = EFFORT_TO_PWM(control_effort >> 8); 
 
   // 3. Ensure ADC is ready and kick off the first sample
   ADCSRA |= _BV(ADEN)| _BV(ADSC); 
@@ -313,7 +337,6 @@ void setup_gen()
 void setup() {
   cli();
 
-  TCCR1 &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12) | _BV(CS13)); // Stop Timer1
 
 #ifdef DEBUG  
   tinySerial_begin();
@@ -324,8 +347,13 @@ void setup() {
   PORTB &= ~(1 << PIN_DEBUG);
 #endif
 
+#ifndef USE_TIMER1
+  // use Timer0 at 8MHz / 1 / 256 == 31.25KHz
+  // disable timer1
+  TCCR1 &= ~(_BV(CS10) | _BV(CS11) | _BV(CS12) | _BV(CS13)); // Stop Timer1
+
   // disable the mosfet
-  pinMode(PIN_PWM, OUTPUT);
+  DDRB |= (1 << PIN_PWM);
 
   // 2. Configure Timer0 for Fast PWM on OC0A (PB0)
   // COM0A1 = 1: Non-inverting PWM (Clear on match, set at BOTTOM)
@@ -335,11 +363,38 @@ void setup() {
   // 3. Set the frequency (Prescaler)
   TCCR0B = (TCCR0B & 0xF8) | 0x01; 
 
-  // 4. Initial state: OFF for P-Channel (255 = Gate High)
+  // 4. Enable Timer0 Overflow Interrupt
+  TIMSK |= _BV(TOIE0);
+#else
+  // --- Timer1 High Speed PWM Setup ---
+  // 1. Enable the PLL and wait for it to lock
+  PLLCSR |= _BV(PLLE);               // Enable PLL
+  delayMicroseconds(100);            // Short wait for PLL to stabilize
+  while (!(PLLCSR & _BV(PLOCK)));    // Wait for PLOCK bit to be set
+  PLLCSR |= _BV(PCKE);               // Enable PLL as PCK (64MHz)
+
+  // 2. Configure Timer1 for PWM on PB0 (OC1A)
+  // PWM1A = 1: Enable PWM mode based on comparator OCR1A
+  // COM1A0 = 1: Inverted Mode (Clear on Match, Set at Bottom, but inverted output)
+  // This means as OCR1A increases, the pin spends MORE time LOW (ON for P-CH)
+  TCCR1 = _BV(PWM1A) | _BV(COM1A0) | _BV(CS11) | _BV(CS10); 
+  // CS11|CS10 = Prescaler /4. Result: 64MHz / 4 / 256 = 62.5kHz
+
+  // 3. Disable Timer0 to save power/cycles (Optional since we use Timer1 ticks now)
+  TCCR0B = 0; 
+  
+  // 4. Enable Timer1 Overflow Interrupt
+  TIMSK |= _BV(TOIE1);
+
+  // 5. Ensure PB0 is an output
+  DDRB |= (1 << PIN_PWM);
+#endif
+
+  // 5. Initial state: OFF for P-Channel (255 = Gate High)
   control_effort = 0 << 8;
   ramped_adc = 32;
-  OCR0A = 255 - ((control_effort) >> 8);
- 
+  PWM_CTR_REG = EFFORT_TO_PWM((control_effort) >> 8);
+
   // configure config pin
   pinMode(PIN_CONFIG, INPUT_PULLUP);
 
@@ -354,8 +409,6 @@ void setup() {
   // Trigger NEXT ADC Conversion
   ADCSRA |= (1 << ADSC);
 
-  // Enable Timer0 Overflow Interrupt
-  TIMSK |= _BV(TOIE0);
   sei();
 
   // configure EEPROM
@@ -398,8 +451,8 @@ void loop()
       training_adc = 0;
       training_cnt = 0;
       training_loop = 0;
-      OCR0A = 255;
-      pre_gen_time = control_ticks + 32000U; // 1s of 8 ticks per ms
+      PWM_CTR_REG = EFFORT_TO_PWM(255);
+      pre_gen_time = control_ticks + MS_TO_TICKS(1000);
     }
   }
 
@@ -418,9 +471,9 @@ void loop()
     case FSM_GEN_FAULT:
       // a fault occurred, so let's sleep for a second, reset to 0.5V and try again
       control_effort = 255 << 8;
-      OCR0A = control_effort >> 8;
+      PWM_CTR_REG = EFFORT_TO_PWM(control_effort >> 8);
       fsm_state = FSM_WAIT_RECOVERY;
-      pre_gen_time = control_ticks + 32000U; // 1000ms of 1 tick/128uS == 1000 * 8/ms
+      pre_gen_time = control_ticks + MS_TO_TICKS(1000);
       break;
     case FSM_WAIT_RECOVERY:
       if (control_ticks >= pre_gen_time) {
